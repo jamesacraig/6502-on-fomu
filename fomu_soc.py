@@ -4,6 +4,7 @@ from fomu_6502_cpu import A6502
 from fomu_6502_rgb import SBLED
 from fomu_spram import FomuSPRAM
 from fomu_6502_rom import FomuROM
+from fomu_6502_wishbone_bridge import FomuBridge
 from migen import *
 
 AddressRange = namedtuple("AddressRange", ("start", "size"))
@@ -23,6 +24,7 @@ class Fomu(Module):
         "paged_rom": AddressRange( 0x8000, 0x4000),
         "low_os_rom": AddressRange( 0xC000, 0x3c00),
         "rgb": AddressRange(0xFE00, 0x10),
+        "wishbone": AddressRange(0xFE20, 0x08), 
         "paging_register": AddressRange(0xFE30, 0x10),
         "high_os_rom": AddressRange(0xFF00, 0xFF),
         }
@@ -75,6 +77,9 @@ class Fomu(Module):
         # LEDs for I/O
         self.submodules.rgb = SBLED(platform)
 
+        # Wishbone bridge
+        self.submodules.wishbone = FomuBridge(platform)
+        
         # Build up a mux for the data bus (in), IRQ, NMI, RDY, and connect up the chip selects.
         mux = Constant(0)
         rdy_mux = Constant(1)

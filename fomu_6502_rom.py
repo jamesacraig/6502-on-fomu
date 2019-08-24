@@ -7,14 +7,14 @@ class FomuROM(Bus6502, Module):
         super().__init__(platform)
         rom_bytes = [
             # Boot rom, starts at 0xFF00
-            0xA9, 0b10000000,  # LDA #&80
+            0xA9, 0b11000000,  # LDA #&80
             0x8D, 0x08, 0xFE,  # STA &FE08   - LEDDCR0
-            0xA9, 187,         # LDA #187
+            0xA9, 186,         # LDA #186
             0x8D, 0x09, 0xFE,  # STA &FE09   - LEDDBR0
-            0xA9, 0x40,        # LDA #&40
+            0xA9, 0x0C,        # LDA #&0C
             0x8D, 0x10, 0xFE,  # STA &FE10   - LEDDONR
-            0x8D, 0x10, 0xFE,  # STA &FE10   - LEDDOFR
-            0xA9, 0x00,        # LDA #&00
+            0x8D, 0x11, 0xFE,  # STA &FE11   - LEDDOFR
+            0xA9, 0xE2,        # LDA #&E2
             0x8D, 0x05, 0xFE,  # STA &FE05   - LEDDBCRR
             0x8D, 0x06, 0xFE,  # STA &FE06   - LEDDBCFR
             0xA9, 0xFF,        # LDA #&FF
