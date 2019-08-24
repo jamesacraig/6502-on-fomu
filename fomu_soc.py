@@ -123,3 +123,12 @@ class Fomu(Module):
                           self.cpu.irq.eq(irq_mux),
                           self.cpu.nmi.eq(nmi_mux),
                           self.address_bus.eq(self.cpu.address)]
+
+
+        # Set up a dummyusb device.
+        from valentyusb.usbcore.cpu import dummyusb
+        from valentyusb.usbcore import io as usbio
+        usb_pads = platform.request("usb")
+        usb_iobuf = usbio.IoBuf(usb_pads.d_p, usb_pads.d_n, usb_pads.pullup)
+        self.submodules.usb = dummyusb.DummyUsb(usb_iobuf, debug=True)
+        

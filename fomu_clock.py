@@ -6,7 +6,7 @@ class CRG(Module):
         clk48_raw = platform.request("clk48")
         clk12 = Signal()
 
-        reset_delay = Signal(12, reset=4095)
+        reset_delay = Signal(4, reset=4)
         self.clock_domains.cd_por = ClockDomain()
         self.reset = Signal()
 
@@ -65,6 +65,8 @@ class CRG(Module):
                 #i_SDI,
             )
         else:
+            clk48 = Signal()
+            clk12_raw = Signal()
             self.specials += Instance(
                 "SB_GB",
                 i_USER_SIGNAL_TO_GLOBAL_BUFFER=clk48_raw,
