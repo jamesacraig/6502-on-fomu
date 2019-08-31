@@ -5,6 +5,7 @@ from fomu_6502_rgb import SBLED
 from fomu_spram import FomuSPRAM
 from fomu_6502_rom import FomuROM
 from fomu_6502_wishbone_bridge import FomuBridge
+from fomu_usb_cdc import FomuUSBCDC
 from migen import *
 
 AddressRange = namedtuple("AddressRange", ("start", "size"))
@@ -126,9 +127,8 @@ class Fomu(Module):
 
 
         # Set up a dummyusb device.
-        from valentyusb.usbcore.cpu import dummyusb
         from valentyusb.usbcore import io as usbio
         usb_pads = platform.request("usb")
         usb_iobuf = usbio.IoBuf(usb_pads.d_p, usb_pads.d_n, usb_pads.pullup)
-        self.submodules.usb = dummyusb.DummyUsb(usb_iobuf, debug=True)
+        self.submodules.usb = FomuUSBCDC(usb_iobuf, debug=True, product="Fomu 6502 Bridge")
         
