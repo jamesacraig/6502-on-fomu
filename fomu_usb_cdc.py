@@ -4,68 +4,100 @@
 from enum import IntEnum
 
 from migen import *
-from migen.genlib import fsm
+from migen.genlib import fsm, fifo
 
 from valentyusb.usbcore.endpoint import EndpointType, EndpointResponse
 from valentyusb.usbcore.pid import PID, PIDTypes
 from valentyusb.usbcore.sm.transfer import UsbTransfer
 from valentyusb.usbcore.cpu.usbwishbonebridge import USBWishboneBridge
 
-class FomuUSBCDC(Module):
+def build_case_mux(selector, cases):
+    """Build an N-way multiplexer (just like Case() except we can
+    handle expressions not just statements.)"""
+    if "default" in cases:
+        output = cases["default"]
+    else:
+        output = 0
+
+    for case, val in cases.items():
+        output = Mux(selector==case, val, output)
+
+    return output
+
+# Function for generating an "if" and eq limiting a value to a maximum.
+# Used to limit the response lengths.
+def _limit_eq(var, value, limiting_value):
+    """Set var to value, but limit it to no more than limiting_value.
     """
-        Basic CDC implementation for the Fomu 6502 core.
+    return If(value > limiting_value, var.eq(limiting_value)).Else(var.eq(value))
+    
+
+
+class Endpoint(Module):
+    """Generic USB endpoint as a FIFO.
+    Assumes both in and out streams; obviously both may not be required. 
+    """
+    def __init__(self, usb_bus, input_fifo_size : int = 128, output_fifo_size : int = 128):
+        # FIFOs for data in/out.
+        input_fifo = self.submodules.input_fifo = fifo.SyncFIFO(8, 128, fwft = False)
+        output_fifo = self.submodules.input_fifo = fifo.SyncFIFO(8, 128, fwft = False)
+    
+class ControlEndpoint(Module):
+    """Control endpoint, handles USB setup packets.
     """
 
-    def __init__(self, iobuf, debug=False, vid=0x1209, pid=0x5bf0,
-        product="Fomu 6502 Bridge",
-        manufacturer="Dark Devices"):
+    @staticmethod
+    def make_usbstr(s : str):
+        """Populate a USB string descriptor with the provided text.
+        """
+        usbstr = bytearray(2)
+        # The first byte is the number of characters in the string.
+        # Because strings are utf_16_le, each character is two-bytes.
+        # That leaves 126 bytes as the maximum length
+        assert(len(s) <= 126)
+        usbstr[0] = (len(s)*2)+2
+        usbstr[1] = 3
+        usbstr.extend(bytes(s, 'utf_16_le'))
+        return list(usbstr)
+
+    def __init__(self, vid = 0x1209, pid = 0x5bf0, product = "Fomu 6502 Bridge", manufacturer = "Dark Devices"):
+
+        # IOs to/from USB core.
+
+        # Inputs
+        self.start = Signal()
+        self.token = Signal(2)
+        self.data_recv_payload = Signal(8)
+        self.data_recv_put = Signal()
+
+        # Outputs
+        self.data_send_payload = Signal(8)
+        self.data_send_have = Signal()
+        self.dtb = Signal()
+        self.ack = Signal()
+        self.stall = Signal()
+        self.address = Signal(7)
         
-        # USB Core
-        self.submodules.usb_core = usb_core = UsbTransfer(iobuf)
-        if usb_core.iobuf.usb_pullup is not None:
-            self.comb += usb_core.iobuf.usb_pullup.eq(1)
-        self.iobuf = usb_core.iobuf
-
-        # SETUP packets contain a DATA segment that is always 8 bytes
-        # (for our purposes)
-        bmRequestType = Signal(8)
-        bRequest = Signal(8)
-        wValue = Signal(16)
-        wIndex = Signal(16)
-        wLength = Signal(16)
-        setup_index = Signal(4)
-
-        address = Signal(7, reset=0)
-        self.comb += usb_core.addr.eq(address),
-
-        def make_usbstr(s):
-            usbstr = bytearray(2)
-            # The first byte is the number of characters in the string.
-            # Because strings are utf_16_le, each character is two-bytes.
-            # That leaves 126 bytes as the maximum length
-            assert(len(s) <= 126)
-            usbstr[0] = (len(s)*2)+2
-            usbstr[1] = 3
-            usbstr.extend(bytes(s, 'utf_16_le'))
-            return list(usbstr)
-
+        # WCID Vendor code.
+        wcid_vendor_code = 0x20
+    
         usb_descriptors = {
             0x100: [ # usb_device_descriptor
-                    0x12, # bLength
-                    0x01, # bDescriptorType
-                    0x00, 0x02, # bcdUSB
-                    0x02, # USB class CDC
-                    0x00, # Subclass
-                    0x00, # Protocol
-                    0x40, # bMaxPacketSize0
-                    (vid>>0)&0xff, (vid>>8)&0xff, # Vendor ID
-                    (pid>>0)&0xff, (pid>>8)&0xff, # Product ID
-                    0x01, 0x01, # bcdDevice (version)
-                    0x01, # iManufacturer
-                    0x02, # iProduct
-                    0x00, # iSerialNumber
-                    0x01  # bNumConfigurations
-            ],
+                0x12, # bLength
+                0x01, # bDescriptorType
+                0x00, 0x02, # bcdUSB
+                0x02, # USB class CDC
+                0x00, # Subclass
+                0x00, # Protocol
+                0x40, # bMaxPacketSize0
+                (vid>>0)&0xff, (vid>>8)&0xff, # Vendor ID
+                (pid>>0)&0xff, (pid>>8)&0xff, # Product ID
+                0x01, 0x01, # bcdDevice (version)
+                0x01, # iManufacturer
+                0x02, # iProduct
+                0x00, # iSerialNumber
+                0x01  # bNumConfigurations
+                ],
 
             0x200: [ # usb_config_descriptor
                 0x09, # bLength
@@ -154,8 +186,8 @@ class FomuUSBCDC(Module):
         0x300: [ # usb_string0_descriptor
                     0x04, 0x03, 0x09, 0x04,
                 ],
-        0x301: make_usbstr(manufacturer),
-        0x302: make_usbstr(product),
+        0x301: self.make_usbstr(manufacturer),
+        0x302: self.make_usbstr(product),
         0x3EE: [ # usb_msft_descriptor 
                 0x12, # bLength
                 0x03, # bDescriptorType - String
@@ -166,7 +198,7 @@ class FomuUSBCDC(Module):
                 0x31, 0x00,
                 0x30, 0x00,
                 0x30, 0x00,
-                0x20, # Vendor Code
+                wcid_vendor_code, # Vendor Code
                 0x00 # Padding
             ],
         0xff00: [ # usb_bos_descriptor 
@@ -211,10 +243,7 @@ class FomuUSBCDC(Module):
         for descriptor_id, descriptor_data in usb_descriptors.items():
             descriptor_start_address[descriptor_id] = next_address
             memory_contents += descriptor_data
-            descriptor_length = len(descriptor_data)
-            next_address += descriptor_length
-            if descriptor_length > 63:
-                raise ValueError("Descriptor",descriptor_id,"is too long (",descriptor_length,"> 64 (wMaxPacketSize) and won't work.")
+            next_address += len(descriptor_data)
             print("Mapped descriptor", descriptor_id,"to",hex(next_address))
 
         # We also need to store the WCID descriptor and default status report here.
@@ -231,84 +260,150 @@ class FomuUSBCDC(Module):
         descriptor_bytes_remaining = Signal(6) # Maximum number of bytes in USB is 64
         self.specials.out_buffer_rd = out_buffer_rd = out_buffer.get_port(write_capable=False, clock_domain="usb_12")
 
-        # Indicates DATA1 or DATA0
-        dtb_polarity = Signal()
-
-        last_start = Signal()
-
-        # Set to 1 if we have a response that matches the requested descriptor
-        have_response = self.have_response = Signal()
-
-        # Needs to be able to index Memory
+        # Response start address, length, and whether we're ack-ing it or not.
         response_addr = Signal(9)
         response_len = Signal(7)
         response_ack = Signal()
+
+        # Delayed transaction start signal.
+        last_start = Signal()
+
+        # SETUP packets contain a DATA segment that is always 8 bytes
+        # (for our purposes)
+        bmRequestType = Signal(8)
+        bRequest = Signal(8)
+        wValue = Signal(16)
+        wIndex = Signal(16)
+        wLength = Signal(16)
+        setup_index = Signal(4)
+        
+        # Build case-dictionary for reads of USB descriptors.
+        descriptor_cases = {
+            descriptor_id: [
+                response_addr.eq(descriptor_start_address[descriptor_id]),
+                _limit_eq(response_len, wLength, len(usb_descriptors[descriptor_id])),
+                _limit_eq(descriptor_bytes_remaining, wLength, len(usb_descriptors[descriptor_id]))
+                ]
+             for descriptor_id in usb_descriptors.keys()}
+            
+        # Set have_response to 1 if we have a response that matches the requested descriptor
+        # and haven't finished sending it back yet.
+        have_response = self.have_response = Signal()
+        self.comb += [
+            have_response.eq(descriptor_bytes_remaining > 0),
+            ]
+
+        # Do we stall, or respond?
+        self.stall = Signal()
+        self.ack = Signal()
+        self.comb += [
+            self.stall.eq(~(have_response | response_ack)),
+            self.ack.eq(have_response | response_ack)
+            ]
+
+        # USB device address
+        address = Signal(7, reset=0)
+
+        # Select buffer address
+        self.comb += [
+            out_buffer_rd.adr.eq(response_addr),
+            ]
+
+        # Map buffer output and have_response to outputs.
+        self.comb += [
+            self.data_send_payload.eq(out_buffer_rd.dat_r),
+            self.data_send_have.eq(have_response)
+            ]
+
+        self.sync += [
+            last_start.eq(self.start), # Generate delayed start signal.
+            If(last_start,
+                   If(self.token == PID.SETUP,
+                          setup_index.eq(0),
+                          descriptor_bytes_remaining.eq(0)
+                    ).Elif(transaction_queued,
+                               self.ack.eq(1),
+                               self.transaction_queued.eq(0),
+                               self.address.eq(new_address))
+                               )
+            ]
+                               
+                          
+                          
+                          
+            ]
+        
+            
+class FomuUSBCDC(Module):
+    """
+        Basic CDC implementation for the Fomu 6502 core.
+    """
+
+    def __init__(self, iobuf, endpoints = [ControlEndpoint()]):
+        # USB Core
+        self.submodules.usb_core = usb_core = UsbTransfer(iobuf)
+
+        # Configure pullups.
+        if usb_core.iobuf.usb_pullup is not None:
+            self.comb += usb_core.iobuf.usb_pullup.eq(1)
+        self.iobuf = usb_core.iobuf
 
         # Used to respond to Transaction stage
         transaction_queued = Signal()
         new_address = Signal(7)
 
-        # Generate debug signals, in case debug is enabled.
-        debug_packet_detected = Signal()
-        debug_data_mux = Signal(8)
-        debug_data_ready_mux = Signal()
-        debug_sink_data = Signal(8)
-        debug_sink_data_ready = Signal()
-        debug_ack_response = Signal()
-
-        # Delay the "put" signal (and corresponding data) by one cycle, to allow
-        # the debug system to inhibit this write.  In practice, this doesn't
-        # impact our latency at all as this signal runs at a rate of ~1 MHz.
-        data_recv_put_delayed = self.data_recv_put_delayed = Signal()
-        data_recv_payload_delayed = self.data_recv_payload_delayed = Signal(8)
-        self.sync += [
-            data_recv_put_delayed.eq(usb_core.data_recv_put),
-            data_recv_payload_delayed.eq(usb_core.data_recv_payload),
+        # Current endpoint.
+        endpoint = Signal(4)
+        self.comb += [
+            endpoint.eq(usb_core.endp)
+            ]
+        
+        # Mux stall/ack/dtb signals across endpoints.
+        self.comb += [
+            # Stall?
+            usb_core.sta.eq(build_case_mux(endpoint, {
+                ep_id: endpoints[ep_id].stall for ep_id in range(len(endpoints))
+                })),
+            # Send ACK in response?
+            usb_core.arm.eq(build_case_mux(endpoint, {
+                ep_id: endpoints[ep_id].ack for ep_id in range(len(endpoints))
+                })),
+            # Output appropriate data toggle bit.
+            usb_core.dtb.eq(build_case_mux(endpoint, {
+                ep_id: endpoints[ep_id].dtb for ep_id in range(len(endpoints))
+                })),
+            # Map the endpoint's readable status to the core's data_send_have.
+            usb_core.data_send_have.eq(build_case_mux(endpoint, {
+                ep_id: endpoints[ep_id].data_send_have for ep_id in range(len(endpoints))
+                })),
+            # Map the endpoint's output to the core's data_send_payload
+            usb_core.data_send_payload.eq(build_case_mux(endpoint, {
+                ep_id: endpoints[ep_id].data_send_payload for ep_id in range(len(endpoints))
+                })),
         ]
 
-        # Wire up debug signals if required
-        if debug:
-            debug_bridge = USBWishboneBridge(usb_core)
-            self.submodules.debug_bridge = ClockDomainsRenamer("usb_12")(debug_bridge)
-            self.comb += [
-                debug_packet_detected.eq(~self.debug_bridge.n_debug_in_progress),
-                debug_sink_data.eq(self.debug_bridge.sink_data),
-                debug_sink_data_ready.eq(self.debug_bridge.sink_valid),
-                debug_ack_response.eq(self.debug_bridge.send_ack | self.debug_bridge.sink_valid),
+        # Send the input stream from the USB core to all endpoints' input bits.
+        self.comb += [
+            endpoints[ep_id].data_recv_payload.eq(usb_core.data_recv_payload) for ep_id in range(len(endpoints))
+            ]
+        # But the recv_data_put to only the active endpoint.
+        self.comb += [
+            endpoints[ep_id].data_recv_put.eq(usb_core.data_recv_payload & ep_id==endpoint) for ep_id in range(len(endpoints))
             ]
 
+        # Send the token type to all endpoints
         self.comb += [
-            # This needs to be correct *before* token is finished, everything
-            # else uses registered outputs.
-            usb_core.sta.eq((~(have_response | response_ack) & ~debug_packet_detected) & ~debug_sink_data_ready),
-            usb_core.arm.eq(((have_response | response_ack) & ~debug_packet_detected) | debug_ack_response),
-            usb_core.dtb.eq(dtb_polarity | debug_packet_detected),
+            endpoints[ep_id].data_recv_payload.eq(usb_core.data_recv_payload) for ep_id in range(len(endpoints))
+            ]
 
-            If(debug_packet_detected,
-                debug_data_mux.eq(debug_sink_data),
-                debug_data_ready_mux.eq(debug_sink_data_ready),
-            ).Else(
-                debug_data_mux.eq(out_buffer_rd.dat_r),
-                debug_data_ready_mux.eq(response_len > 0),
-            ),
-            out_buffer_rd.adr.eq(response_addr),
-            usb_core.data_send_have.eq(debug_data_ready_mux),
-            usb_core.data_send_payload.eq(debug_data_mux),
-            have_response.eq(response_len > 0),
-        ]
-
-        # Function for generating an "if" and eq limiting a value to a maximum.
-        # Used to limit the response lengths.
-        def limit_eq(var, value, limiting_value):
-            return If(value > limiting_value, var.eq(limiting_value)).Else(var.eq(value))
+        # Use the control endpoint's address value for the USB core.
+        self.comb += [
+            usb_core.addr.eq(endpoints[0].address)
+            ]
         
-        # Build cases for reads of USB descriptors.
-        descriptor_cases = {
-            descriptor_id: [
-                response_addr.eq(descriptor_start_address[descriptor_id]),
-                limit_eq(response_len, wLength, len(usb_descriptors[descriptor_id]))
-                ]
-             for descriptor_id in usb_descriptors.keys()}
+        # Generate a delayed packet start signal, and use it to check
+        # the token type. If it's a setup packet, we reset the DTB
+        # polarity.
         
         self.sync += [
             last_start.eq(usb_core.start),
@@ -324,19 +419,19 @@ class FomuUSBCDC(Module):
                 )
             ),
             If(usb_core.tok == PID.SETUP,
-                If(data_recv_put_delayed,
+                If(usb_core.data_recv_put,
                     If(setup_index < 8,
                         setup_index.eq(setup_index + 1),
                     ),
                     Case(setup_index, {
-                        0: bmRequestType.eq(data_recv_payload_delayed),
-                        1: bRequest.eq(data_recv_payload_delayed),
-                        2: wValue.eq(data_recv_payload_delayed),
-                        3: wValue.eq(Cat(wValue[0:8], data_recv_payload_delayed)),
-                        4: wIndex.eq(data_recv_payload_delayed),
-                        5: wIndex.eq(Cat(wIndex[0:8], data_recv_payload_delayed)),
-                        6: wLength.eq(data_recv_payload_delayed),
-                        7: wLength.eq(Cat(wLength[0:8], data_recv_payload_delayed)),
+                        0: bmRequestType.eq(usb_core.data_recv_payload),
+                        1: bRequest.eq(usb_core.data_recv_payload),
+                        2: wValue.eq(usb_core.data_recv_payload),
+                        3: wValue.eq(Cat(wValue[0:8], usb_core.data_recv_payload)),
+                        4: wIndex.eq(usb_core.data_recv_payload),
+                        5: wIndex.eq(Cat(wIndex[0:8], usb_core.data_recv_payload)),
+                        6: wLength.eq(usb_core.data_recv_payload),
+                        7: wLength.eq(Cat(wLength[0:8], usb_core.data_recv_payload)),
                     }),
                 ),
             ),
@@ -349,12 +444,12 @@ class FomuUSBCDC(Module):
                                     Case(wValue, descriptor_cases)).Elif(
                            bRequest == 0x00,
                            response_addr.eq(usb_device_status_report_address),
-                           limit_eq(response_len, wLength, len(usb_device_status_report))
+                           _limit_eq(response_len, wLength, len(usb_device_status_report))
                            ),
                               # MS Extended Compat ID OS Feature
                 0xc0: [
                     response_addr.eq(usb_wcid_descriptor_address),
-                    limit_eq(response_len, wLength, len(usb_wcid_descriptor))
+                    _limit_eq(response_len, wLength, len(usb_wcid_descriptor))
                     ],
                 # Set Address / Configuration
                 0x00: [
@@ -369,11 +464,11 @@ class FomuUSBCDC(Module):
             If(usb_core.data_send_get,
                 response_ack.eq(1),
                 response_addr.eq(response_addr + 1),
-                If(response_len,
-                    response_len.eq(response_len - 1),
+                If(descriptor_bytes_remaining,
+                    descriptor_bytes_remaining.eq(descriptor_bytes_remaining - 1),
                 ),
             ),
-            If(self.data_recv_put_delayed,
+            If(usb_core.data_recv_put,
                 response_ack.eq(0),
                 transaction_queued.eq(1),
             ),

@@ -130,5 +130,5 @@ class Fomu(Module):
         from valentyusb.usbcore import io as usbio
         usb_pads = platform.request("usb")
         usb_iobuf = usbio.IoBuf(usb_pads.d_p, usb_pads.d_n, usb_pads.pullup)
-        self.submodules.usb = FomuUSBCDC(usb_iobuf, debug=True, product="Fomu 6502 Bridge")
+        self.submodules.usb = FomuUSBCDC(usb_iobuf)
         
