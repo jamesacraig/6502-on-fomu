@@ -69,6 +69,7 @@ class ControlEndpoint(Module):
         self.token = Signal(2)
         self.data_recv_payload = Signal(8)
         self.data_recv_put = Signal()
+        self.data_send_get = Signal()
 
         # Outputs
         self.data_send_payload = Signal(8)
@@ -276,6 +277,10 @@ class ControlEndpoint(Module):
         wIndex = Signal(16)
         wLength = Signal(16)
         setup_index = Signal(4)
+
+        # Used to respond to Transaction stage
+        transaction_queued = Signal()
+        new_address = Signal(7)
         
         # Build case-dictionary for reads of USB descriptors.
         descriptor_cases = {
@@ -314,7 +319,7 @@ class ControlEndpoint(Module):
             self.data_send_payload.eq(out_buffer_rd.dat_r),
             self.data_send_have.eq(have_response)
             ]
-
+        
         self.sync += [
             last_start.eq(self.start), # Generate delayed start signal.
             If(last_start,
@@ -323,17 +328,63 @@ class ControlEndpoint(Module):
                           descriptor_bytes_remaining.eq(0)
                     ).Elif(transaction_queued,
                                self.ack.eq(1),
-                               self.transaction_queued.eq(0),
+                               transaction_queued.eq(0),
                                self.address.eq(new_address))
-                               )
-            ]
-                               
-                          
-                          
-                          
-            ]
-        
+                               ),
+            If(self.token == PID.SETUP,
+                If(self.data_recv_put,
+                    If(setup_index < 8,
+                        setup_index.eq(setup_index + 1),
+                    ),
+                    Case(setup_index, {
+                        0: bmRequestType.eq(self.data_recv_payload),
+                        1: bRequest.eq(self.data_recv_payload),
+                        2: wValue.eq(self.data_recv_payload),
+                        3: wValue.eq(Cat(wValue[0:8], self.data_recv_payload)),
+                        4: wIndex.eq(self.data_recv_payload),
+                        5: wIndex.eq(Cat(wIndex[0:8], self.data_recv_payload)),
+                        6: wLength.eq(self.data_recv_payload),
+                        7: wLength.eq(Cat(wLength[0:8], self.data_recv_payload)),
+                    }),
+                ),
+            ),
+            If(self.token == PID.SETUP,
+                   Case (bmRequestType, {
+                       0x80: If(bRequest == 0x06,
+                                    Case(wValue, descriptor_cases)).Elif(
+                           bRequest == 0x00,
+                           response_addr.eq(usb_device_status_report_address),
+                           _limit_eq(response_len, wLength, len(usb_device_status_report))
+                           ),
+                              # MS Extended Compat ID OS Feature
+                0xc0: [
+                    response_addr.eq(usb_wcid_descriptor_address),
+                    _limit_eq(response_len, wLength, len(usb_wcid_descriptor))
+                    ],
+                # Set Address / Configuration
+                0x00: [
+                    response_ack.eq(1),
+                    # Set Address
+                    If(bRequest == 0x05,
+                           new_address.eq(wValue[0:7]),
+                           )
+                    ]
+                })
+            ),
             
+            If(self.data_send_get,
+                response_ack.eq(1),
+                response_addr.eq(response_addr + 1),
+                If(descriptor_bytes_remaining,
+                    descriptor_bytes_remaining.eq(descriptor_bytes_remaining - 1),
+                ),
+            ),
+            If(self.data_recv_put,
+                response_ack.eq(0),
+                transaction_queued.eq(1),
+            ),
+        ]
+        
 class FomuUSBCDC(Module):
     """
         Basic CDC implementation for the Fomu 6502 core.
@@ -347,10 +398,6 @@ class FomuUSBCDC(Module):
         if usb_core.iobuf.usb_pullup is not None:
             self.comb += usb_core.iobuf.usb_pullup.eq(1)
         self.iobuf = usb_core.iobuf
-
-        # Used to respond to Transaction stage
-        transaction_queued = Signal()
-        new_address = Signal(7)
 
         # Current endpoint.
         endpoint = Signal(4)
@@ -388,9 +435,14 @@ class FomuUSBCDC(Module):
             ]
         # But the recv_data_put to only the active endpoint.
         self.comb += [
-            endpoints[ep_id].data_recv_put.eq(usb_core.data_recv_payload & ep_id==endpoint) for ep_id in range(len(endpoints))
+            endpoints[ep_id].data_recv_put.eq(usb_core.data_recv_payload & wrap(ep_id==endpoint)) for ep_id in range(len(endpoints))
             ]
-
+        # Same for data_send_get
+        self.comb += [
+            endpoints[ep_id].data_send_get.eq(usb_core.data_send_get & wrap(ep_id==endpoint)) for ep_id in range(len(endpoints))
+            ]
+        
+        
         # Send the token type to all endpoints
         self.comb += [
             endpoints[ep_id].data_recv_payload.eq(usb_core.data_recv_payload) for ep_id in range(len(endpoints))
@@ -398,82 +450,10 @@ class FomuUSBCDC(Module):
 
         # Use the control endpoint's address value for the USB core.
         self.comb += [
-            usb_core.addr.eq(endpoints[0].address)
+            usb_core.addr.eq(endpoints[0].address),
             ]
         
-        # Generate a delayed packet start signal, and use it to check
-        # the token type. If it's a setup packet, we reset the DTB
-        # polarity.
-        
-        self.sync += [
-            last_start.eq(usb_core.start),
-            If(last_start,
-                If(usb_core.tok == PID.SETUP,
-                    setup_index.eq(0),
-                    dtb_polarity.eq(1),
-                    response_len.eq(0),
-                ).Elif(transaction_queued,
-                    response_ack.eq(1),
-                    transaction_queued.eq(0),
-                    address.eq(new_address),
-                )
-            ),
-            If(usb_core.tok == PID.SETUP,
-                If(usb_core.data_recv_put,
-                    If(setup_index < 8,
-                        setup_index.eq(setup_index + 1),
-                    ),
-                    Case(setup_index, {
-                        0: bmRequestType.eq(usb_core.data_recv_payload),
-                        1: bRequest.eq(usb_core.data_recv_payload),
-                        2: wValue.eq(usb_core.data_recv_payload),
-                        3: wValue.eq(Cat(wValue[0:8], usb_core.data_recv_payload)),
-                        4: wIndex.eq(usb_core.data_recv_payload),
-                        5: wIndex.eq(Cat(wIndex[0:8], usb_core.data_recv_payload)),
-                        6: wLength.eq(usb_core.data_recv_payload),
-                        7: wLength.eq(Cat(wLength[0:8], usb_core.data_recv_payload)),
-                    }),
-                ),
-            ),
-
-
-            # Handle USB control endpoint commands.
-            If(usb_core.setup,
-                   Case (bmRequestType, {
-                       0x80: If(bRequest == 0x06,
-                                    Case(wValue, descriptor_cases)).Elif(
-                           bRequest == 0x00,
-                           response_addr.eq(usb_device_status_report_address),
-                           _limit_eq(response_len, wLength, len(usb_device_status_report))
-                           ),
-                              # MS Extended Compat ID OS Feature
-                0xc0: [
-                    response_addr.eq(usb_wcid_descriptor_address),
-                    _limit_eq(response_len, wLength, len(usb_wcid_descriptor))
-                    ],
-                # Set Address / Configuration
-                0x00: [
-                    response_ack.eq(1),
-                    # Set Address
-                    If(bRequest == 0x05,
-                           new_address.eq(wValue[0:7]),
-                           )
-                    ]
-                })
-            ),
-            If(usb_core.data_send_get,
-                response_ack.eq(1),
-                response_addr.eq(response_addr + 1),
-                If(descriptor_bytes_remaining,
-                    descriptor_bytes_remaining.eq(descriptor_bytes_remaining - 1),
-                ),
-            ),
-            If(usb_core.data_recv_put,
-                response_ack.eq(0),
-                transaction_queued.eq(1),
-            ),
-        ]
-
+        # Reset on error.
         self.sync += [
             If(usb_core.error,
                 usb_core.reset.eq(1),
